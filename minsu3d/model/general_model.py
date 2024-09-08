@@ -8,7 +8,7 @@ from minsu3d.common_ops.functions import common_ops
 from minsu3d.evaluation.instance_segmentation import GeneralDatasetEvaluator
 from minsu3d.evaluation.object_detection import evaluate_bbox_acc
 from minsu3d.loss.pt_offset_loss import PTOffsetLoss
-from minsu3d.model.module import Backbone
+from minsu3d.model.module import Backbone, BackboneFPN
 from minsu3d.util.io import save_prediction
 from minsu3d.util.lr_decay import cosine_lr_decay
 
@@ -20,10 +20,16 @@ class GeneralModel(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters()
         input_channel = 3 + cfg.model.network.use_color * 3 + cfg.model.network.use_normal * 3
-        self.backbone = Backbone(
-            input_channel=input_channel, output_channel=cfg.model.network.m, block_channels=cfg.model.network.blocks,
-            block_reps=cfg.model.network.block_reps, sem_classes=cfg.data.classes
-        )
+        if cfg.model.network.use_fpn:
+            self.backbone = BackboneFPN(
+                input_channel=input_channel, output_channel=cfg.model.network.m, block_channels=cfg.model.network.blocks,
+                block_reps=cfg.model.network.block_reps, sem_classes=cfg.data.classes
+            )
+        else:
+            self.backbone = Backbone(
+                input_channel=input_channel, output_channel=cfg.model.network.m, block_channels=cfg.model.network.blocks,
+                block_reps=cfg.model.network.block_reps, sem_classes=cfg.data.classes
+            )
         self.val_test_step_outputs = []
         self.cfg = cfg
 

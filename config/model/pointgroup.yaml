@@ -28,6 +28,8 @@ network:
   cluster_blocks: [1, 2]
   block_reps: 2
 
+  use_fpn: True
+
   use_color: False
   use_normal: True
 
