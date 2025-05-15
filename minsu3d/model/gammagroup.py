@@ -1,7 +1,14 @@
+import json
+import os
+
 import numpy as np
 import torch.nn as nn
 from minsu3d.common_ops.functions import common_ops, pointgroup_ops
-from minsu3d.evaluation.instance_segmentation import get_gt_instances, rle_encode
+from minsu3d.evaluation.instance_segmentation import (
+    get_gt_instances,
+    rle_decode,
+    rle_encode,
+)
 from minsu3d.evaluation.object_detection import get_gt_bbox
 from minsu3d.evaluation.semantic_segmentation import *
 from minsu3d.model.general_model import (
@@ -12,7 +19,7 @@ from minsu3d.model.general_model import (
 from minsu3d.model.module import TinyUnet
 
 
-class PointGroup(GeneralModel):
+class GammaGroup(GeneralModel):
     def __init__(self, cfg):
         super().__init__(cfg)
         output_channel = cfg.model.network.m
@@ -117,7 +124,6 @@ class PointGroup(GeneralModel):
         # prepare input and forward
         output_dict = self(data_dict)
         losses = self._loss(data_dict, output_dict)
-
         # log losses
         total_loss = 0
         for loss_name, loss_value in losses.items():
@@ -171,10 +177,8 @@ class PointGroup(GeneralModel):
             semantic_mean_iou = evaluate_semantic_miou(
                 semantic_predictions, data_dict["sem_labels"], ignore_label=-1
             )
-
         if self.current_epoch > self.hparams.cfg.model.network.prepare_epochs:
             point_xyz_cpu = data_dict["point_xyz"].flatten(end_dim=1).cpu().numpy()
-            #print(point_xyz_cpu.shape)
 
             pred_instances = self._get_pred_instances(data_dict["scan_ids"][0],
                                                       point_xyz_cpu,
@@ -183,7 +187,6 @@ class PointGroup(GeneralModel):
                                                       output_dict["proposal_scores"][2].size(0) - 1,
                                                       output_dict["semantic_scores"].cpu(),
                                                       len(self.hparams.cfg.data.ignore_classes))
-            #print(np.shape(pred_instances))
             gt_instances = None
             gt_instances_bbox = None
             if self.hparams.cfg.model.inference.evaluate:
@@ -196,6 +199,69 @@ class PointGroup(GeneralModel):
                                                 instance_ids_cpu.numpy(),
                                                 sem_labels.numpy(), -1,
                                                 self.hparams.cfg.data.ignore_classes)
+            # Infer mobility parameters
+
+            pred_motion_types = output_dict["gamma_motion_scores"].argmax(dim=1).cpu().numpy().astype(int)
+            pred_axis_directions = output_dict["gamma_directions"].cpu().numpy().astype(float)
+            pred_axis_offsets = output_dict["gamma_offsets"].cpu().numpy().astype(float)
+
+            save_dir = save_dir = os.path.join(
+                    self.hparams.cfg.exp_output_root_path, 'inference', self.hparams.cfg.model.inference.split,
+                    'predictions', "motion"
+                )
+
+            os.makedirs(save_dir, exist_ok=True)
+
+            for idx, pred_instance in enumerate(pred_instances):
+                if pred_instance["label_id"] == 4:
+                    continue
+
+                pred_mask = rle_decode(pred_instance["pred_mask"]).astype(bool)
+                instance_motion_type = int(np.bincount(pred_motion_types[pred_mask]).argmax())
+
+                motion_axis = np.median(pred_axis_directions[pred_mask], axis=0)
+                motion_axis /= np.linalg.norm(motion_axis)
+
+                # In order to figure out origin:
+                # 1. Project the points to the axis according to offsets
+                # 2. Find the point lying in the most opposite direction to the axis
+
+                cur_points = point_xyz_cpu[pred_mask]
+                if not self.hparams.cfg.model.network.use_projection_origin:
+                    cur_offsets = pred_axis_offsets[pred_mask]
+                    points_axis_projected = cur_points + cur_offsets  # Points + predicted axis projection vectors
+
+                    dot_products = (points_axis_projected * motion_axis).sum(axis=1)
+
+                    origin_idx = np.argmin(dot_products)
+
+                    motion_origin = points_axis_projected[origin_idx]
+
+                else:
+                    cur_offsets = output_dict["gamma_offsets"][pred_mask].cpu().numpy()
+
+                    points_origin_projected = cur_points + cur_offsets
+
+                    if self.hparams.cfg.model.network.mean_origin:
+                        motion_origin = points_origin_projected.mean(axis=0)
+                    elif self.hparams.cfg.model.network.median_origin:
+                        motion_origin = np.median(points_origin_projected, axis=0)
+                    else:
+                        raise ValueError("Invalid origin type")
+
+                native_motion_type = int(instance_motion_type)
+                native_motion_origin = [float(x) for x in motion_origin.tolist()]
+                native_motion_axis = [float(x) for x in motion_axis.tolist()]
+
+                motion_dict = {
+                    "mtype": native_motion_type,
+                    "morigin": native_motion_origin,
+                    "maxis": native_motion_axis
+                }
+
+                with open(f"{save_dir}/{pred_instance['scan_id']}-{idx}.json", 'w') as f:
+                    json.dump(motion_dict, f)
+
             self.val_test_step_outputs.append(
                 (semantic_accuracy, semantic_mean_iou, pred_instances, gt_instances, gt_instances_bbox)
             )

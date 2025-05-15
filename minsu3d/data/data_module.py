@@ -1,9 +1,11 @@
-import torch
-import MinkowskiEngine as ME
-import pytorch_lightning as pl
 from importlib import import_module
+
+import pytorch_lightning as pl
+import torch
 from torch.utils.data import DataLoader
 from torch.utils.data._utils.collate import default_collate
+
+import MinkowskiEngine as ME
 
 
 class DataModule(pl.LightningDataModule):
@@ -51,7 +53,13 @@ def _sparse_collate_fn(batch):
     total_num_inst = 0
     batch_data = []
 
-    default_collate_items = ("scan_id", "point_xyz", "point_rgb", "point_normal",)
+    if "instance_motion_types" in batch[0]:
+        # Training FPNGroupMot, not required for inference
+        # Note that might be buggy due do data inconsistencies
+        # In this case, comment-out if/else just leaving the collate items on the next line to be the default
+        default_collate_items = ("scan_id", "point_xyz", "point_rgb", "point_normal", "instance_motion_types", "instance_axis_offsets", "instance_axis_directions", "instance_origin_offsets")
+    else:
+        default_collate_items = ("scan_id", "point_xyz", "point_rgb", "point_normal",)
     scan_ids = []
 
     for i, b in enumerate(batch):

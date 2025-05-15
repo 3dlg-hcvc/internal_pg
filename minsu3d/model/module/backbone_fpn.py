@@ -69,7 +69,7 @@ class EnhancedMLP(nn.Module):
         return x
 
 class BackboneFPN(nn.Module):
-    def __init__(self, input_channel, output_channel, block_channels, block_reps, sem_classes):
+    def __init__(self, input_channel, output_channel, block_channels, block_reps, sem_classes, use_gamma):
         super().__init__()
 
         self.pointnext = PointNeXt()
@@ -87,18 +87,39 @@ class BackboneFPN(nn.Module):
 
         self.offset_branch = EnhancedMLP(output_channel, output_channel // 2, 3)
 
+        if use_gamma:
+            self.gamma_fpn = EnhancedFPN(output_channel, fpn_channels)
+
+            self.gamma_post_fpn_conv = BottleneckBlock(post_fpn_channels, output_channel)
+
+            self.gamma_motion_branch = EnhancedMLP(output_channel, output_channel // 2, 2)
+
+            self.gamma_offset_branch = EnhancedMLP(output_channel, output_channel // 2, 3)
+
+            self.gamma_direction_branch = EnhancedMLP(output_channel, output_channel // 2, 3)
+
     def forward(self, input_dict, model_ids=None):
         output_dict = {}
         point_features_dense = self.pointnext(input_dict)
-        
+
         x = self.pre_fpn_conv(point_features_dense)
         fpn_features = self.fpn(x)
         enhanced_features = self.post_fpn_conv(fpn_features)
 
         point_features_sparse = enhanced_features.transpose(1, 2).reshape(-1, enhanced_features.shape[1])
-        
+
         output_dict["point_features"] = point_features_sparse
         output_dict["semantic_scores"] = self.semantic_branch(point_features_sparse)
         output_dict["point_offsets"] = self.offset_branch(point_features_sparse)
-        
+
+        if hasattr(self, "gamma_fpn"):
+            gamma_fpn_features = self.gamma_fpn(x)
+            gamma_enhanced_features = self.gamma_post_fpn_conv(gamma_fpn_features)
+
+            gamma_point_features_sparse = gamma_enhanced_features.transpose(1, 2).reshape(-1, gamma_enhanced_features.shape[1])
+
+            output_dict["gamma_offsets"] = self.gamma_offset_branch(gamma_point_features_sparse)
+            output_dict["gamma_directions"] = self.gamma_direction_branch(gamma_point_features_sparse)
+            output_dict["gamma_motion_scores"] = self.gamma_motion_branch(gamma_point_features_sparse)
+
         return output_dict

@@ -87,6 +87,11 @@ class GeneralDataset(Dataset):
         point_xyz = scene["xyz"].astype(np.float32)  # (N, 3)
         colors = scene["rgb"].astype(np.float32)  # (N, 3)
         normals = scene["normal"].astype(np.float32)  # (N, 3)
+        if self.split == "train" or self.split == "val" and self.cfg.model.network.use_gamma:
+            point_motion_types = scene["instance_motion_types"].astype(np.int16)  # (N, )
+            point_axis_offsets = scene["instance_axis_offsets"].astype(np.float32)  # (N, 3)
+            point_axis_directions = scene["instance_axis_directions"].astype(np.float32)  # (N, 3)
+            point_origin_offsets = scene["instance_origin_offsets"].astype(np.float32)  # (N, 3)
 
         instance_ids = scene["instance_ids"].astype(np.int16)  # (N, )
         sem_labels = scene["sem_labels"].astype(np.int16)  # (N, )
@@ -151,5 +156,11 @@ class GeneralDataset(Dataset):
         data["instance_ids"] = instance_ids  # (N, 1)
         data["instance_center_xyz"] = instance_center_xyz
         data["instance_num_point"] = np.array(instance_num_point, dtype=np.int32)
+
+        if self.split == "train" or self.split == "val" and self.cfg.model.network.use_gamma:
+            data["instance_motion_types"] = point_motion_types
+            data["instance_axis_offsets"] = point_axis_offsets
+            data["instance_axis_directions"] = point_axis_directions
+            data["instance_origin_offsets"] = point_origin_offsets
 
         return data

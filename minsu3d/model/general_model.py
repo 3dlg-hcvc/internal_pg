@@ -11,6 +11,7 @@ from minsu3d.loss.pt_offset_loss import PTOffsetLoss
 from minsu3d.model.module import Backbone, BackboneFPN
 from minsu3d.util.io import save_prediction
 from minsu3d.util.lr_decay import cosine_lr_decay
+from torch.nn import functional as F
 
 import MinkowskiEngine as ME
 
@@ -23,7 +24,7 @@ class GeneralModel(pl.LightningModule):
         if cfg.model.network.use_fpn:
             self.backbone = BackboneFPN(
                 input_channel=input_channel, output_channel=cfg.model.network.m, block_channels=cfg.model.network.blocks,
-                block_reps=cfg.model.network.block_reps, sem_classes=cfg.data.classes
+                block_reps=cfg.model.network.block_reps, sem_classes=cfg.data.classes, use_gamma=cfg.model.network.use_gamma
             )
         else:
             self.backbone = Backbone(
@@ -34,7 +35,48 @@ class GeneralModel(pl.LightningModule):
         self.cfg = cfg
 
     def configure_optimizers(self):
-        return hydra.utils.instantiate(self.hparams.cfg.model.optimizer, params=self.parameters())
+        if hasattr(self, 'existing_param_keys') and hasattr(self, 'missing_param_keys'):
+            new_params = []
+            existing_params = []
+
+            for name, param in self.named_parameters():
+                param_key = name
+
+                if param_key in self.existing_param_keys:
+                    existing_params.append(param)
+                    print(f"Parameter with lower LR: {name}")
+                else:
+                    new_params.append(param)
+                    print(f"Parameter with higher LR: {name}")
+
+            param_groups = []
+
+            if new_params:
+                param_groups.append({
+                    'params': new_params, 
+                    'lr': getattr(self, 'new_params_lr', self.cfg.model.optimizer.lr)
+                })
+
+            if existing_params:
+                param_groups.append({
+                    'params': existing_params, 
+                    'lr': getattr(self, 'existing_params_lr', self.cfg.model.optimizer.lr * 0.1)
+                })
+
+            if self.cfg.model.optimizer.name == 'Adam':
+                optimizer = torch.optim.Adam(
+                    param_groups,
+                )
+            elif self.cfg.model.optimizer.name == 'AdamW':
+                optimizer = torch.optim.AdamW(
+                    param_groups,
+                )
+            else:
+                raise NotImplementedError
+        else:
+            optimizer = hydra.utils.instantiate(self.cfg.model.optimizer, params=self.parameters())
+
+        return optimizer
 
     def forward(self, data_dict):
         input_dict = {"coord": data_dict["point_xyz"]}
@@ -61,6 +103,119 @@ class GeneralModel(pl.LightningModule):
         losses["offset_norm_loss"], losses["offset_dir_loss"] = pt_offset_criterion(
             output_dict["point_offsets"], gt_offsets, valid_mask=valid
         )
+
+        if self.cfg.model.network.use_gamma:
+            # Gamma losses
+            gt_motion_types = data_dict["instance_motion_types"].reshape(-1)
+
+            if self.hparams.cfg.model.network.use_projection_origin:
+                gt_axis_offsets = data_dict["instance_origin_offsets"].reshape(-1, 3)
+            else:
+                gt_axis_offsets = data_dict["instance_axis_offsets"].reshape(-1, 3)
+            gt_directions = data_dict["instance_axis_directions"].reshape(-1, 3)
+            valid = torch.logical_and(data_dict["instance_ids"] != -1, gt_motion_types != 2)
+
+            gamma_offset_norm_loss, gamma_offset_dir_loss = pt_offset_criterion(
+                output_dict["gamma_offsets"], gt_axis_offsets, valid_mask=valid
+            )
+
+            losses["gamma_offset_norm_loss"] = self.cfg.model.network.motion_losses_weight * gamma_offset_norm_loss
+            losses["gamma_offset_dir_loss"] = self.cfg.model.network.motion_losses_weight * gamma_offset_dir_loss
+
+            gamma_direction_norm_loss, gamma_direction_dir_loss = pt_offset_criterion(
+                output_dict["gamma_directions"], gt_directions, valid_mask=valid
+            )
+
+            losses["gamma_direction_norm_loss"] = self.cfg.model.network.motion_losses_weight * gamma_direction_norm_loss
+            losses["gamma_direction_dir_loss"] = self.cfg.model.network.motion_losses_weight * gamma_direction_dir_loss
+
+            if self.cfg.model.network.use_gamma_ce:
+                gamma_motion_type_loss = torch.nn.functional.cross_entropy(
+                    output_dict["gamma_motion_scores"], gt_motion_types.long(), ignore_index=2
+                )
+
+                losses["gamma_motion_type_loss"] = self.cfg.model.network.motion_losses_weight * gamma_motion_type_loss
+
+            else:
+                # From https://github.com/qiaojunyu/GAMMA-ICRA2024/blob/master/visual_model/losses.py
+                def focal_loss(
+                    inputs: torch.Tensor,
+                    targets: torch.Tensor,
+                    alpha: torch.Tensor = None,
+                    gamma: float = 2.0,
+                    reduction: str = "mean",
+                    ignore_index: int = -100,
+                ) -> torch.Tensor:
+                    if ignore_index is not None:
+                        valid_mask = targets != ignore_index
+                        targets = targets[valid_mask]
+
+                        if targets.shape[0] == 0:
+                            return torch.tensor(0.0).to(dtype=inputs.dtype, device=inputs.device)
+
+                        inputs = inputs[valid_mask]
+
+                    log_p = F.log_softmax(inputs, dim=-1)
+                    ce_loss = F.nll_loss(
+                        log_p, targets.long(), weight=alpha, ignore_index=ignore_index, reduction="none"
+                    )
+
+                    log_p_t = log_p.gather(1, targets[:, None].long()).squeeze(-1)
+                    loss = ce_loss * ((1 - log_p_t.exp()) ** gamma)
+
+                    if reduction == "mean":
+                        loss = loss.mean()
+                    elif reduction == "sum":
+                        loss = loss.sum()
+
+                    return loss
+
+                def dice_loss(input: torch.Tensor, target: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+                    input_soft = F.softmax(input, dim=1)
+
+                    target_one_hot = one_hot(target, num_classes=input.shape[1], device=input.device, dtype=input.dtype)
+
+                    intersection = torch.sum(input_soft * target_one_hot, dim=0)
+
+                    cardinality = torch.sum(input_soft, dim=0) + torch.sum(target_one_hot, dim=0)
+
+                    dice_score = 2.0 * intersection / (cardinality + eps)
+
+                    return torch.mean(-dice_score + 1.0)
+
+                def one_hot(
+                    labels: torch.Tensor,
+                    num_classes: int,
+                    device: torch.device = None,
+                    dtype: torch.dtype = None,
+                    eps: float = 1e-6,
+                ) -> torch.Tensor:
+                    if not isinstance(labels, torch.Tensor):
+                        raise TypeError(f"Input labels type is not a torch.Tensor. Got {type(labels)}")
+
+                    labels_64 = labels.clone().to(torch.int64)
+
+                    if num_classes < 1:
+                        raise ValueError("The number of classes must be bigger than one." f" Got: {num_classes}")
+
+                    shape = labels_64.shape
+                    if device is None:
+                        device = labels_64.device
+
+                    one_hot_tensor = torch.zeros((shape[0], num_classes) + shape[1:], device=device, dtype=dtype)
+
+                    safe_labels = torch.clamp(labels_64, 0, num_classes - 1)
+
+                    result = one_hot_tensor.scatter_(1, safe_labels.unsqueeze(1), 1.0) + eps
+
+                    return result
+
+                focal = focal_loss(output_dict["gamma_motion_scores"], gt_motion_types, gamma=2.0, alpha=None, reduction="mean", ignore_index=2)
+
+                dice = dice_loss(output_dict["gamma_motion_scores"], gt_motion_types)
+
+                losses["gamma_motion_type_loss"] = self.cfg.model.network.motion_losses_weight * (focal + dice)
+
         return losses
 
     def training_step(self, data_dict, idx):

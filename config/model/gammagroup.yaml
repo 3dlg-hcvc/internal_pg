@@ -1,0 +1,63 @@
+# Managed by Hydra
+
+defaults:
+  - base
+
+log:
+  WandbLogger:
+    project: PointGroup
+    name: ${experiment_name}
+  TensorBoardLogger:
+    name: PointGroup
+
+trainer:
+  max_epochs: 496
+
+optimizer:
+    _target_: torch.optim.AdamW
+    lr: 0.002
+    name: AdamW
+
+lr_decay:
+  decay_start_epoch: 250
+
+network:
+  module: GammaGroup  # PointGroup for training
+
+  m: 48 # 16 or 32
+  blocks: [1, 2, 3, 4, 5, 6, 7]
+  cluster_blocks: [1, 2]
+  block_reps: 2
+
+  use_fpn: True
+
+  use_gamma: True
+  use_gamma_ce: True
+  motion_losses_weight: 1.0
+
+  use_projection_origin: False
+  mean_origin: False
+  median_origin: True
+
+  use_color: False
+  use_normal: True
+
+  fg_thresh: 0.75
+  bg_thresh: 0.25
+
+  score_scale: 50  # the minimal voxel size is 2cm
+  score_fullscale: 14
+
+  prepare_epochs: 128
+
+  cluster:
+    # point grouping
+    cluster_radius: 0.03
+    cluster_meanActive: 50
+    cluster_shift_meanActive: 300
+    cluster_npoint_thre: 50
+
+  test:
+    TEST_NMS_THRESH: 0.3
+    TEST_SCORE_THRESH: 0.09
+    TEST_NPOINT_THRESH: 100
